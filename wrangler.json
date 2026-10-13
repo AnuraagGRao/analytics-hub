@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "analytics-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "telemetry-db",
+      "database_id": "ee1d0be8-3877-42e8-8162-0106f4f7f4ec"
+    }
+  ]
+}
