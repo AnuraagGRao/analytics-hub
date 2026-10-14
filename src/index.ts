@@ -1,17 +1,141 @@
 export interface Env {
   DB: D1Database;
+  ADMIN_PASSWORD?: string;
+  SESSION_SECRET?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Cryptographic Authentication & Session Utilities
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SECRET_FALLBACK = "anuraag-telemetry-cluster-secure-seed-2026";
+const DEFAULT_PASSWORD_FALLBACK = "anuraag-craft-2026";
+
+async function getHmacKey(secret: string): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  return crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+// Constant-time comparison using SHA-256 digests to eliminate timing attacks
+async function verifyPassword(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const hashA = await crypto.subtle.digest("SHA-256", enc.encode(provided));
+  const hashB = await crypto.subtle.digest("SHA-256", enc.encode(expected));
+  return crypto.subtle.timingSafeEqual(hashA, hashB);
+}
+
+// Generate signed HMAC-SHA256 JWT-style session token (valid for 30 days)
+async function generateSessionToken(secret: string): Promise<string> {
+  const enc = new TextEncoder();
+  const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" })).replace(/=/g, "");
+  const payload = btoa(
+    JSON.stringify({
+      user: "anuraag",
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60, // 30 days
+    })
+  ).replace(/=/g, "");
+
+  const data = `${header}.${payload}`;
+  const key = await getHmacKey(secret);
+  const signature = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+
+  const sigBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+
+  return `${data}.${sigBase64}`;
+}
+
+// Verify HMAC-SHA256 signature and expiration
+async function verifySessionToken(token: string, secret: string): Promise<boolean> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return false;
+    const [header, payload, signature] = parts;
+    const data = `${header}.${payload}`;
+
+    const key = await getHmacKey(secret);
+
+    // Decode base64url signature
+    const sigStr = signature.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = sigStr.length % 4 === 0 ? "" : "=".repeat(4 - (sigStr.length % 4));
+    const rawSig = Uint8Array.from(atob(sigStr + pad), (c) => c.charCodeAt(0));
+
+    const enc = new TextEncoder();
+    const isValid = await crypto.subtle.verify("HMAC", key, rawSig, enc.encode(data));
+    if (!isValid) return false;
+
+    // Check expiration
+    const payloadStr = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
+    const parsed = JSON.parse(payloadStr) as { exp?: number };
+    if (!parsed.exp || parsed.exp < Math.floor(Date.now() / 1000)) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Extract token from Cookie or Authorization header
+function extractToken(request: Request): string | null {
+  const cookieHeader = request.headers.get("Cookie");
+  if (cookieHeader) {
+    const cookies = Object.fromEntries(
+      cookieHeader.split(";").map((c) => {
+        const [k, ...v] = c.trim().split("=");
+        return [k, v.join("=")];
+      })
+    );
+    if (cookies["analytics_session"]) {
+      return cookies["analytics_session"];
+    }
+  }
+
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    return authHeader.substring(7);
+  }
+
+  return null;
+}
+
+// Check if incoming request is authenticated
+async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
+  const token = extractToken(request);
+  const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD || DEFAULT_SECRET_FALLBACK;
+  const adminPassword = env.ADMIN_PASSWORD || DEFAULT_PASSWORD_FALLBACK;
+
+  if (!token) return false;
+
+  // 1. Direct Bearer token match with admin password (for curl/scripts)
+  if (token === adminPassword) return true;
+
+  // 2. Cryptographic JWT session validation
+  return verifySessionToken(token, secret);
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry Parsing Helpers
+// ---------------------------------------------------------------------------
 
 function parseUserAgent(ua: string | null): { device: string; browser: string; os: string } {
   if (!ua) return { device: "desktop", browser: "other", os: "other" };
   const lower = ua.toLowerCase();
 
-  // Device
   let device = "desktop";
   if (/mobile|android|iphone|ipod/.test(lower)) device = "mobile";
   else if (/tablet|ipad/.test(lower)) device = "tablet";
 
-  // OS
   let os = "other";
   if (lower.includes("windows")) os = "Windows";
   else if (lower.includes("mac os") || lower.includes("macintosh")) os = "macOS";
@@ -19,7 +143,6 @@ function parseUserAgent(ua: string | null): { device: string; browser: string; o
   else if (lower.includes("android")) os = "Android";
   else if (lower.includes("linux")) os = "Linux";
 
-  // Browser
   let browser = "other";
   if (lower.includes("edg/")) browser = "Edge";
   else if (lower.includes("chrome") && !lower.includes("edg/")) browser = "Chrome";
@@ -42,7 +165,7 @@ function sanitizeReferrer(raw: string | null): string {
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 export default {
@@ -54,7 +177,9 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // 1. Telemetry Ingestion Endpoint: /api/hit
+    // -----------------------------------------------------------------------
+    // 1. PUBLIC INGESTION: /api/hit and /hit.gif
+    // -----------------------------------------------------------------------
     if (url.pathname === "/api/hit" || url.pathname === "/hit.gif") {
       let project = url.searchParams.get("project") || "";
       let path = url.searchParams.get("path") || "/";
@@ -62,12 +187,12 @@ export default {
 
       if (request.method === "POST") {
         try {
-          const body = await request.json() as Record<string, string>;
+          const body = (await request.json()) as Record<string, string>;
           if (body.project) project = body.project;
           if (body.path) path = body.path;
           if (body.referrer) referrer = body.referrer;
         } catch {
-          // Fall back to query parameters
+          // Fall back to query params
         }
       }
 
@@ -95,7 +220,7 @@ export default {
           .catch((err) => console.error("D1 write error:", err))
       );
 
-      // 1x1 transparent GIF response if requested as image beacon
+      // 1x1 transparent GIF response
       if (url.pathname === "/hit.gif") {
         const gifBytes = new Uint8Array([
           0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00,
@@ -118,7 +243,9 @@ export default {
       });
     }
 
-    // 2. Embeddable Tracking Script: /tracker.js
+    // -----------------------------------------------------------------------
+    // 2. PUBLIC SCRIPT: /tracker.js
+    // -----------------------------------------------------------------------
     if (url.pathname === "/tracker.js") {
       const script = `
 (function(){
@@ -172,62 +299,9 @@ export default {
       });
     }
 
-    // 3. Telemetry Query API: /api/stats
-    if (url.pathname === "/api/stats") {
-      const project = url.searchParams.get("project");
-      const whereClause = project && project !== "all" ? "WHERE project = ?" : "";
-      const bindings = project && project !== "all" ? [project] : [];
-
-      // Query totals
-      const totalRes = await env.DB.prepare(
-        `SELECT COUNT(*) as total_views FROM page_views ${whereClause}`
-      )
-        .bind(...bindings)
-        .first<{ total_views: number }>();
-
-      // Query top projects
-      const projectsRes = await env.DB.prepare(
-        `SELECT project, COUNT(*) as views FROM page_views GROUP BY project ORDER BY views DESC LIMIT 10`
-      ).all();
-
-      // Query top countries
-      const countriesRes = await env.DB.prepare(
-        `SELECT country, COUNT(*) as views FROM page_views ${whereClause} GROUP BY country ORDER BY views DESC LIMIT 10`
-      )
-        .bind(...bindings)
-        .all();
-
-      // Query top referrers
-      const referrersRes = await env.DB.prepare(
-        `SELECT referrer, COUNT(*) as views FROM page_views ${whereClause} GROUP BY referrer ORDER BY views DESC LIMIT 10`
-      )
-        .bind(...bindings)
-        .all();
-
-      // Query recent hits
-      const recentRes = await env.DB.prepare(
-        `SELECT project, path, country, city, device, browser, created_at FROM page_views ${whereClause} ORDER BY created_at DESC LIMIT 20`
-      )
-        .bind(...bindings)
-        .all();
-
-      return new Response(
-        JSON.stringify({
-          project: project || "all",
-          totalViews: totalRes?.total_views || 0,
-          topProjects: projectsRes.results,
-          topCountries: countriesRes.results,
-          topReferrers: referrersRes.results,
-          recent: recentRes.results,
-          timestamp: new Date().toISOString(),
-        }),
-        {
-          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-        }
-      );
-    }
-
-    // 4. SVG Badge Generator: /api/badge
+    // -----------------------------------------------------------------------
+    // 3. PUBLIC BADGE: /api/badge
+    // -----------------------------------------------------------------------
     if (url.pathname === "/api/badge") {
       const project = url.searchParams.get("project") || "all";
       const whereClause = project !== "all" ? "WHERE project = ?" : "";
@@ -274,8 +348,271 @@ export default {
       });
     }
 
-    // 5. Live Glassmorphic Web Dashboard: /
-    const html = `
+    // -----------------------------------------------------------------------
+    // 4. AUTHENTICATION ENDPOINTS: /api/login and /api/logout
+    // -----------------------------------------------------------------------
+    if (url.pathname === "/api/login" && request.method === "POST") {
+      try {
+        const body = (await request.json()) as { password?: string };
+        const providedPassword = (body.password || "").trim();
+        const expectedPassword = env.ADMIN_PASSWORD || DEFAULT_PASSWORD_FALLBACK;
+
+        const isMatch = await verifyPassword(providedPassword, expectedPassword);
+
+        if (!isMatch) {
+          return new Response(
+            JSON.stringify({ ok: false, error: "Invalid master security key" }),
+            { status: 401, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
+          );
+        }
+
+        // Generate signed token
+        const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD || DEFAULT_SECRET_FALLBACK;
+        const sessionToken = await generateSessionToken(secret);
+
+        // Set HttpOnly, Secure, SameSite=Strict cookie for 30 days
+        const cookie = `analytics_session=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`;
+
+        return new Response(JSON.stringify({ ok: true, message: "Authenticated successfully" }), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Set-Cookie": cookie,
+            ...CORS_HEADERS,
+          },
+        });
+      } catch {
+        return new Response(
+          JSON.stringify({ ok: false, error: "Bad request payload" }),
+          { status: 400, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
+        );
+      }
+    }
+
+    if (url.pathname === "/api/logout" && request.method === "POST") {
+      const clearCookie = `analytics_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+      return new Response(JSON.stringify({ ok: true, message: "Logged out" }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Set-Cookie": clearCookie,
+          ...CORS_HEADERS,
+        },
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. PROTECTED API: /api/stats
+    // -----------------------------------------------------------------------
+    if (url.pathname === "/api/stats") {
+      const authed = await isAuthenticated(request, env);
+      if (!authed) {
+        return new Response(
+          JSON.stringify({
+            error: "Unauthorized",
+            message: "Authentication required to access analytics query API. Please log in at /.",
+          }),
+          {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+          }
+        );
+      }
+
+      const project = url.searchParams.get("project");
+      const whereClause = project && project !== "all" ? "WHERE project = ?" : "";
+      const bindings = project && project !== "all" ? [project] : [];
+
+      const totalRes = await env.DB.prepare(
+        `SELECT COUNT(*) as total_views FROM page_views ${whereClause}`
+      )
+        .bind(...bindings)
+        .first<{ total_views: number }>();
+
+      const projectsRes = await env.DB.prepare(
+        `SELECT project, COUNT(*) as views FROM page_views GROUP BY project ORDER BY views DESC LIMIT 10`
+      ).all();
+
+      const countriesRes = await env.DB.prepare(
+        `SELECT country, COUNT(*) as views FROM page_views ${whereClause} GROUP BY country ORDER BY views DESC LIMIT 10`
+      )
+        .bind(...bindings)
+        .all();
+
+      const referrersRes = await env.DB.prepare(
+        `SELECT referrer, COUNT(*) as views FROM page_views ${whereClause} GROUP BY referrer ORDER BY views DESC LIMIT 10`
+      )
+        .bind(...bindings)
+        .all();
+
+      const recentRes = await env.DB.prepare(
+        `SELECT project, path, country, city, device, browser, created_at FROM page_views ${whereClause} ORDER BY created_at DESC LIMIT 20`
+      )
+        .bind(...bindings)
+        .all();
+
+      return new Response(
+        JSON.stringify({
+          project: project || "all",
+          totalViews: totalRes?.total_views || 0,
+          topProjects: projectsRes.results,
+          topCountries: countriesRes.results,
+          topReferrers: referrersRes.results,
+          recent: recentRes.results,
+          timestamp: new Date().toISOString(),
+        }),
+        {
+          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+        }
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. DASHBOARD & LOGIN PORTAL: /
+    // -----------------------------------------------------------------------
+    const authed = await isAuthenticated(request, env);
+
+    // If NOT authenticated, render the secure Login Screen
+    if (!authed) {
+      const loginHtml = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Operator Access Required | Telemetry Hub</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background-color: #07090e; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .glass { background: rgba(13, 18, 30, 0.8); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.1); }
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      20%, 60% { transform: translateX(-6px); }
+      40%, 80% { transform: translateX(6px); }
+    }
+    .shake { animation: shake 0.4s ease-in-out; }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4 relative overflow-hidden">
+  <!-- Ambient background glow -->
+  <div class="absolute w-[500px] h-[500px] bg-cyan-500/10 rounded-full blur-3xl pointer-events-none -top-24 -left-24"></div>
+  <div class="absolute w-[400px] h-[400px] bg-violet-500/10 rounded-full blur-3xl pointer-events-none -bottom-20 -right-20"></div>
+
+  <div class="w-full max-w-md p-8 rounded-3xl glass shadow-2xl relative z-10 border border-white/10 space-y-6">
+    <!-- Header -->
+    <div class="space-y-2 text-center">
+      <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-[11px] font-mono text-cyan-400">
+        <span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
+        <span>ANURAAGGRAO.COM / SECURITY</span>
+      </div>
+      <h1 class="text-2xl font-bold tracking-tight text-white">Operator Access Required</h1>
+      <p class="text-xs text-slate-400 leading-relaxed font-mono">
+        Telemetry and visitor intelligence are restricted to verified operators. Enter your master access key below.
+      </p>
+    </div>
+
+    <!-- Error message banner -->
+    <div id="errorBanner" class="hidden p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-xs font-mono text-center"></div>
+
+    <!-- Login Form -->
+    <form id="loginForm" class="space-y-4" onsubmit="handleLogin(event)">
+      <div class="space-y-1.5">
+        <label for="password" class="text-xs font-mono text-slate-300 block">Master Security Key</label>
+        <div class="relative">
+          <input
+            type="password"
+            id="password"
+            required
+            autocomplete="current-password"
+            placeholder="••••••••••••••••"
+            class="w-full bg-slate-950/80 border border-white/15 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 font-mono transition-all"
+          />
+          <button
+            type="button"
+            onclick="togglePassword()"
+            class="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-200 font-mono px-2 py-1"
+          >
+            show
+          </button>
+        </div>
+      </div>
+
+      <button
+        type="submit"
+        id="submitBtn"
+        class="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-500 hover:from-cyan-400 hover:to-sky-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-cyan-500/20 hover:scale-[1.01] active:scale-[0.99]"
+      >
+        Unlock Console
+      </button>
+    </form>
+
+    <!-- Footer footnote -->
+    <div class="pt-4 border-t border-white/10 text-center text-[10px] font-mono text-slate-500 space-y-1">
+      <div>Protected by Cloudflare V8 Edge Isolates</div>
+      <div class="text-slate-600">Timing-Safe HMAC-SHA256 Cryptographic Sessions</div>
+    </div>
+  </div>
+
+  <script>
+    function togglePassword() {
+      const input = document.getElementById('password');
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const pwd = document.getElementById('password').value;
+      const btn = document.getElementById('submitBtn');
+      const err = document.getElementById('errorBanner');
+      const form = document.getElementById('loginForm');
+
+      btn.disabled = true;
+      btn.innerText = "Verifying...";
+      err.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pwd })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.ok) {
+          btn.innerText = "Access Granted";
+          btn.classList.remove('from-cyan-500', 'to-sky-500');
+          btn.classList.add('from-emerald-500', 'to-teal-500');
+          setTimeout(() => {
+            window.location.reload();
+          }, 300);
+        } else {
+          err.innerText = data.error || "Invalid security key";
+          err.classList.remove('hidden');
+          form.classList.add('shake');
+          setTimeout(() => form.classList.remove('shake'), 400);
+          btn.disabled = false;
+          btn.innerText = "Unlock Console";
+          document.getElementById('password').focus();
+        }
+      } catch (e) {
+        err.innerText = "Connection failed. Please check network.";
+        err.classList.remove('hidden');
+        btn.disabled = false;
+        btn.innerText = "Unlock Console";
+      }
+    }
+  </script>
+</body>
+</html>
+      `.trim();
+
+      return new Response(loginHtml, {
+        headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS },
+      });
+    }
+
+    // If AUTHENTICATED, render the Full Dashboard with Sign Out button
+    const dashboardHtml = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -284,7 +621,7 @@ export default {
   <title>Telemetry Hub | anuraaggrao.com</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    body { background-color: #090d16; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { background-color: #090d16; color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     .glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
   </style>
 </head>
@@ -295,6 +632,11 @@ export default {
         <span>ANURAAGGRAO.COM</span>
         <span>/</span>
         <span>TELEMETRY CLOUD</span>
+        <span>/</span>
+        <span class="text-emerald-400 font-semibold flex items-center gap-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+          AUTHENTICATED
+        </span>
       </div>
       <h1 class="text-3xl font-extrabold tracking-tight text-white flex items-center gap-3">
         Domain Visitor Intelligence
@@ -304,9 +646,10 @@ export default {
       </p>
     </div>
 
-    <div class="flex items-center gap-2">
-      <select id="projectSelect" class="bg-slate-900 border border-slate-700 text-xs rounded-xl px-3 py-2 text-slate-200 focus:outline-none">
+    <div class="flex items-center gap-2 flex-wrap">
+      <select id="projectSelect" class="bg-slate-900 border border-slate-700 text-xs rounded-xl px-3 py-2 text-slate-200 focus:outline-none font-mono">
         <option value="all">All Projects</option>
+        <option value="craft">craft.anuraaggrao.com</option>
         <option value="utils">utils.anuraaggrao.com</option>
         <option value="music">music.anuraaggrao.com</option>
         <option value="status">status.anuraaggrao.com</option>
@@ -315,8 +658,11 @@ export default {
         <option value="quiz">quiz.anuraaggrao.com</option>
         <option value="volt">volt.anuraaggrao.com</option>
       </select>
-      <button onclick="loadStats()" class="px-3 py-2 rounded-xl text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition-all">
+      <button onclick="loadStats()" class="px-3.5 py-2 rounded-xl text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition-all font-mono">
         Refresh
+      </button>
+      <button onclick="logout()" class="px-3.5 py-2 rounded-xl text-xs font-semibold bg-white/5 hover:bg-red-500/20 text-slate-300 hover:text-red-300 border border-white/10 hover:border-red-500/30 transition-all font-mono">
+        Sign Out
       </button>
     </div>
   </header>
@@ -405,16 +751,28 @@ export default {
       <span class="font-bold text-slate-200">How to track any project:</span>
       <p class="text-slate-400 mt-0.5">Drop this single script tag into the &lt;head&gt; or layout of any site:</p>
       <code class="block mt-2 p-2.5 rounded-lg bg-slate-950 font-mono text-cyan-300 border border-slate-800 text-[11px] overflow-x-auto">
-        &lt;script defer src="${url.origin}/tracker.js" data-project="utils"&gt;&lt;/script&gt;
+        &lt;script defer src="${url.origin}/tracker.js" data-project="craft"&gt;&lt;/script&gt;
       </code>
     </div>
   </div>
 
   <script>
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+      } finally {
+        window.location.reload();
+      }
+    }
+
     async function loadStats() {
       const proj = document.getElementById('projectSelect').value;
       try {
         const res = await fetch('/api/stats?project=' + encodeURIComponent(proj));
+        if (res.status === 401) {
+          window.location.reload();
+          return;
+        }
         const data = await res.json();
         
         document.getElementById('totalViews').innerText = data.totalViews.toLocaleString();
@@ -461,7 +819,7 @@ export default {
 </html>
     `.trim();
 
-    return new Response(html, {
+    return new Response(dashboardHtml, {
       headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS },
     });
   },
