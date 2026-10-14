@@ -8,9 +8,6 @@ export interface Env {
 // Cryptographic Authentication & Session Utilities
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SECRET_FALLBACK = "anuraag-telemetry-cluster-secure-seed-2026";
-const DEFAULT_PASSWORD_FALLBACK = "anuraag-craft-2026";
-
 async function getHmacKey(secret: string): Promise<CryptoKey> {
   const enc = new TextEncoder();
   return crypto.subtle.importKey(
@@ -112,13 +109,12 @@ function extractToken(request: Request): string | null {
 // Check if incoming request is authenticated
 async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
   const token = extractToken(request);
-  const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD || DEFAULT_SECRET_FALLBACK;
-  const adminPassword = env.ADMIN_PASSWORD || DEFAULT_PASSWORD_FALLBACK;
+  if (!token || !env.ADMIN_PASSWORD) return false;
 
-  if (!token) return false;
+  const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD;
 
   // 1. Direct Bearer token match with admin password (for curl/scripts)
-  if (token === adminPassword) return true;
+  if (token === env.ADMIN_PASSWORD) return true;
 
   // 2. Cryptographic JWT session validation
   return verifySessionToken(token, secret);
@@ -355,9 +351,14 @@ export default {
       try {
         const body = (await request.json()) as { password?: string };
         const providedPassword = (body.password || "").trim();
-        const expectedPassword = env.ADMIN_PASSWORD || DEFAULT_PASSWORD_FALLBACK;
+        if (!env.ADMIN_PASSWORD) {
+          return new Response(
+            JSON.stringify({ ok: false, error: "Server authentication key is not configured" }),
+            { status: 500, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
+          );
+        }
 
-        const isMatch = await verifyPassword(providedPassword, expectedPassword);
+        const isMatch = await verifyPassword(providedPassword, env.ADMIN_PASSWORD);
 
         if (!isMatch) {
           return new Response(
@@ -367,7 +368,7 @@ export default {
         }
 
         // Generate signed token
-        const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD || DEFAULT_SECRET_FALLBACK;
+        const secret = env.SESSION_SECRET || env.ADMIN_PASSWORD;
         const sessionToken = await generateSessionToken(secret);
 
         // Set HttpOnly, Secure, SameSite=Strict cookie for 30 days
