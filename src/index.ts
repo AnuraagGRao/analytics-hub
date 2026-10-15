@@ -446,8 +446,14 @@ export default {
         .bind(...bindings)
         .all();
 
+      const pathsRes = await env.DB.prepare(
+        `SELECT path, COUNT(*) as views FROM page_views ${whereClause} GROUP BY path ORDER BY views DESC LIMIT 10`
+      )
+        .bind(...bindings)
+        .all();
+
       const recentRes = await env.DB.prepare(
-        `SELECT project, path, country, city, device, browser, created_at FROM page_views ${whereClause} ORDER BY created_at DESC LIMIT 20`
+        `SELECT project, path, country, city, device, browser, created_at FROM page_views ${whereClause} ORDER BY created_at DESC LIMIT 25`
       )
         .bind(...bindings)
         .all();
@@ -459,6 +465,7 @@ export default {
           topProjects: projectsRes.results,
           topCountries: countriesRes.results,
           topReferrers: referrersRes.results,
+          topPaths: pathsRes.results,
           recent: recentRes.results,
           timestamp: new Date().toISOString(),
         }),
@@ -649,15 +656,17 @@ export default {
 
     <div class="flex items-center gap-2 flex-wrap">
       <select id="projectSelect" class="bg-slate-900 border border-slate-700 text-xs rounded-xl px-3 py-2 text-slate-200 focus:outline-none font-mono">
-        <option value="all">All Projects</option>
-        <option value="craft">craft.anuraaggrao.com</option>
-        <option value="utils">utils.anuraaggrao.com</option>
-        <option value="music">music.anuraaggrao.com</option>
-        <option value="status">status.anuraaggrao.com</option>
-        <option value="portfolio">anuraaggrao.com</option>
-        <option value="countdown">countdown.anuraaggrao.com</option>
-        <option value="quiz">quiz.anuraaggrao.com</option>
-        <option value="volt">volt.anuraaggrao.com</option>
+        <option value="all">🌐 All Ecosystem Projects</option>
+        <option value="craft">craft.anuraaggrao.com (Craft Studio)</option>
+        <option value="utils">utils.anuraaggrao.com (Developer Recon)</option>
+        <option value="music">music.anuraaggrao.com (Audio DSP)</option>
+        <option value="status">status.anuraaggrao.com (Status Biome)</option>
+        <option value="portfolio">anuraaggrao.com (Main Portal)</option>
+        <option value="volt">volt.anuraaggrao.com (Battery Monitor)</option>
+        <option value="quiz">quiz.anuraaggrao.com (Context0 Quiz)</option>
+        <option value="tetra">tetra.anuraaggrao.com (Tetra Arcade)</option>
+        <option value="countdown">countdown.anuraaggrao.com (EpiCountdown)</option>
+        <option value="fidget">fidget.anuraaggrao.com (Sensory Suite)</option>
       </select>
       <button onclick="loadStats()" class="px-3.5 py-2 rounded-xl text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-slate-950 transition-all font-mono">
         Refresh
@@ -669,7 +678,7 @@ export default {
   </header>
 
   <!-- Metrics Grid -->
-  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+  <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
     <div class="p-5 rounded-2xl glass">
       <span class="text-xs text-slate-400 font-medium">Total Recorded Hits</span>
       <div id="totalViews" class="text-3xl font-bold font-mono text-cyan-400 mt-1">--</div>
@@ -685,19 +694,39 @@ export default {
     <div class="p-5 rounded-2xl glass">
       <span class="text-xs text-slate-400 font-medium">Top Country Origin</span>
       <div id="topCountry" class="text-3xl font-bold font-mono text-emerald-400 mt-1">--</div>
-      <span class="text-[11px] text-slate-500">Dominant visitor demographic</span>
+      <span class="text-[11px] text-slate-500">Dominant demographic</span>
+    </div>
+
+    <div class="p-5 rounded-2xl glass">
+      <span class="text-xs text-slate-400 font-medium">Auto-Telemetry</span>
+      <div class="flex items-center gap-2 mt-2">
+        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="text-sm font-bold font-mono text-white">LIVE PROBES</span>
+      </div>
+      <span class="text-[11px] text-slate-500">Sub-10ms D1 ingestion</span>
     </div>
   </div>
 
-  <!-- Tables Grid -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+  <!-- Tables Grid: 4 Drilldown Cards -->
+  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
     <!-- Top Countries -->
     <div class="p-5 rounded-2xl glass flex flex-col">
       <h3 class="text-sm font-semibold text-slate-200 mb-3 flex items-center justify-between">
-        <span>Visitor Locations (Countries)</span>
-        <span class="text-[10px] text-cyan-400 font-mono">Cloudflare CF-IPCountry</span>
+        <span>Visitor Origin</span>
+        <span class="text-[10px] text-cyan-400 font-mono">Countries</span>
       </h3>
       <div id="countriesList" class="space-y-2 text-xs divide-y divide-slate-800/80 overflow-y-auto max-h-64">
+        <div class="py-4 text-center text-slate-500">No events yet</div>
+      </div>
+    </div>
+
+    <!-- Top Visited Routes -->
+    <div class="p-5 rounded-2xl glass flex flex-col">
+      <h3 class="text-sm font-semibold text-slate-200 mb-3 flex items-center justify-between">
+        <span>Top Routes</span>
+        <span class="text-[10px] text-sky-400 font-mono">Paths</span>
+      </h3>
+      <div id="pathsList" class="space-y-2 text-xs divide-y divide-slate-800/80 overflow-y-auto max-h-64">
         <div class="py-4 text-center text-slate-500">No events yet</div>
       </div>
     </div>
@@ -705,8 +734,8 @@ export default {
     <!-- Top Referrers -->
     <div class="p-5 rounded-2xl glass flex flex-col">
       <h3 class="text-sm font-semibold text-slate-200 mb-3 flex items-center justify-between">
-        <span>Visitor From (Referrers)</span>
-        <span class="text-[10px] text-violet-400 font-mono">Traffic Source</span>
+        <span>Traffic Sources</span>
+        <span class="text-[10px] text-violet-400 font-mono">Referrers</span>
       </h3>
       <div id="referrersList" class="space-y-2 text-xs divide-y divide-slate-800/80 overflow-y-auto max-h-64">
         <div class="py-4 text-center text-slate-500">No events yet</div>
@@ -716,8 +745,8 @@ export default {
     <!-- Top Projects -->
     <div class="p-5 rounded-2xl glass flex flex-col">
       <h3 class="text-sm font-semibold text-slate-200 mb-3 flex items-center justify-between">
-        <span>Traffic per Subdomain</span>
-        <span class="text-[10px] text-emerald-400 font-mono">Breakdown</span>
+        <span>Subdomain Share</span>
+        <span class="text-[10px] text-emerald-400 font-mono">Hits</span>
       </h3>
       <div id="projectsList" class="space-y-2 text-xs divide-y divide-slate-800/80 overflow-y-auto max-h-64">
         <div class="py-4 text-center text-slate-500">No events yet</div>
@@ -727,7 +756,10 @@ export default {
 
   <!-- Live Stream Table -->
   <div class="p-5 rounded-2xl glass">
-    <h3 class="text-sm font-semibold text-slate-200 mb-3">Recent Live Visits</h3>
+    <h3 class="text-sm font-semibold text-slate-200 mb-3 flex items-center justify-between">
+      <span>Recent Live Ingestion Stream</span>
+      <span class="text-xs font-mono text-cyan-400">Chronological Telemetry</span>
+    </h3>
     <div class="overflow-x-auto">
       <table class="w-full text-left text-xs">
         <thead class="text-slate-400 border-b border-slate-800">
@@ -736,7 +768,7 @@ export default {
             <th class="py-2 px-3">Path</th>
             <th class="py-2 px-3">Country / City</th>
             <th class="py-2 px-3">Device & Browser</th>
-            <th class="py-2 px-3 text-right">Time</th>
+            <th class="py-2 px-3 text-right">Timestamp</th>
           </tr>
         </thead>
         <tbody id="recentTable" class="divide-y divide-slate-800/60 font-mono">
@@ -786,10 +818,16 @@ export default {
           \`<div class="py-2 flex items-center justify-between"><span class="font-mono text-slate-300">\${c.country}</span><span class="font-bold text-cyan-400 font-mono">\${c.views}</span></div>\`
         ).join('') || '<div class="py-4 text-center text-slate-500">No events yet</div>';
 
+        // Render paths
+        const pathList = document.getElementById('pathsList');
+        pathList.innerHTML = (data.topPaths || []).map(p => 
+          \`<div class="py-2 flex items-center justify-between"><span class="font-mono text-slate-300 truncate max-w-[160px]">\${p.path}</span><span class="font-bold text-sky-400 font-mono">\${p.views}</span></div>\`
+        ).join('') || '<div class="py-4 text-center text-slate-500">No events yet</div>';
+
         // Render referrers
         const rList = document.getElementById('referrersList');
         rList.innerHTML = (data.topReferrers || []).map(r => 
-          \`<div class="py-2 flex items-center justify-between"><span class="truncate max-w-[200px] text-slate-300 font-mono">\${r.referrer}</span><span class="font-bold text-violet-400 font-mono">\${r.views}</span></div>\`
+          \`<div class="py-2 flex items-center justify-between"><span class="truncate max-w-[160px] text-slate-300 font-mono">\${r.referrer}</span><span class="font-bold text-violet-400 font-mono">\${r.views}</span></div>\`
         ).join('') || '<div class="py-4 text-center text-slate-500">No events yet</div>';
 
         // Render projects
@@ -815,6 +853,8 @@ export default {
     }
     document.getElementById('projectSelect').addEventListener('change', loadStats);
     loadStats();
+    // Auto-poll every 30s
+    setInterval(loadStats, 30000);
   </script>
 </body>
 </html>
