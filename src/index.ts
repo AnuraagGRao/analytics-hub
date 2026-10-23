@@ -345,6 +345,33 @@ export default {
     }
 
     // -----------------------------------------------------------------------
+    // 3.1. PUBLIC COUNT API: /api/count
+    // -----------------------------------------------------------------------
+    if (url.pathname === "/api/count") {
+      const project = url.searchParams.get("project") || "all";
+      const whereClause = project !== "all" ? "WHERE project = ?" : "";
+      const bindings = project !== "all" ? [project] : [];
+
+      const totalRes = await env.DB.prepare(
+        `SELECT COUNT(*) as total FROM page_views ${whereClause}`
+      )
+        .bind(...bindings)
+        .first<{ total: number }>();
+
+      const total = totalRes?.total || 0;
+      return new Response(
+        JSON.stringify({ ok: true, project, count: total, timestamp: Date.now() }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            ...CORS_HEADERS,
+          },
+        }
+      );
+    }
+
+    // -----------------------------------------------------------------------
     // 4. AUTHENTICATION ENDPOINTS: /api/login and /api/logout
     // -----------------------------------------------------------------------
     if (url.pathname === "/api/login" && request.method === "POST") {
